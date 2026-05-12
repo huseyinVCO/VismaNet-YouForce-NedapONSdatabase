@@ -1,0 +1,349 @@
+--#Tabels
+
+--Users
+CREATE TABLE IF NOT EXISTS dbusers (
+    userid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    username VARCHAR(100) NOT NULL UNIQUE DEFAULT current_user,
+    role VARCHAR(100) NOT NULL,
+    changetimestamp TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    changeuser_id UUID,         
+    changeuser VARCHAR(100), 
+
+    CONSTRAINT fk_dbusers_changeuser
+        FOREIGN KEY (changeuser_id)
+        REFERENCES dbusers(userid)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+--WFM
+CREATE TABLE IF NOT EXISTS wfm_nedapons_clients (
+    clientid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    client VARCHAR(200) NOT NULL UNIQUE,
+    configuration JSONB NOT NULL DEFAULT '{}'::jsonb,
+    active BOOL default false,
+    changetimestamp TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    changeuser_id UUID NOT NULL,
+    changeuser VARCHAR(100) NOT NULL,
+
+    CONSTRAINT fk_clients_changeuser
+        FOREIGN KEY (changeuser_id)
+        REFERENCES dbusers(userid)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE
+);
+
+--VismaNet
+CREATE TABLE IF NOT EXISTS vismanet_nedapons_clients (
+    clientid UUID PRIMARY KEY UNIQUE DEFAULT gen_random_uuid(),
+    client VARCHAR(200) NOT NULL UNIQUE,
+    configuration JSONB NOT NULL DEFAULT '{}'::jsonb,
+    active BOOL default false,
+    changetimestamp TIMESTAMPTZ NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+    changeuser_id UUID NOT NULL,
+    changeuser VARCHAR(100) NOT NULL,
+
+    CONSTRAINT fk_clients_changeuser
+        FOREIGN KEY (changeuser_id)
+        REFERENCES dbusers(userid)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE);
+
+  --Nedap
+CREATE TABLE IF NOT EXISTS nedapons (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    clientid_vismanet UUID NULL,
+    clientid_wfm UUID NULL,
+    api_certificate TEXT ,
+    api_certificate_pass TEXT ,
+    xml_pass TEXT ,
+    changetimestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    changeuser_id UUID NOT NULL,
+    changeuser VARCHAR(100) NOT NULL,
+
+    CONSTRAINT fk_nedapons_client_vismanet
+        FOREIGN KEY (clientid_vismanet)
+        REFERENCES vismanet_nedapons_clients (clientid)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE,
+
+    CONSTRAINT fk_nedapons_client_wfm
+        FOREIGN KEY (clientid_wfm)
+        REFERENCES wfm_nedapons_clients (clientid)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE,
+
+    CONSTRAINT fk_nedapons_changeuser
+        FOREIGN KEY (changeuser_id)
+        REFERENCES dbusers(userid)
+        ON DELETE RESTRICT
+        ON UPDATE CASCADE,
+        
+    -- Ensure exactly one client column is set
+    CONSTRAINT chk_exactly_one_client
+        CHECK ((clientid_vismanet IS NOT NULL AND clientid_wfm IS NULL)OR (clientid_vismanet IS NULL AND clientid_wfm IS NOT NULL)),CONSTRAINT uq_clientid_vismanet UNIQUE(clientid_vismanet));
+
+--#Functions
+
+-- Users update 
+CREATE OR REPLACE FUNCTION set_changeuser()
+RETURNS TRIGGER AS $$
+DECLARE
+    user_name VARCHAR(100);
+    user_id UUID;
+BEGIN
+   -- Handle changeuser auto
+
+    IF TG_TABLE_NAME = 'dbusers' THEN
+        -- Determine username
+        IF NEW.changeuser IS NOT NULL THEN
+            user_name := NEW.changeuser;
+        ELSE
+            user_name := COALESCE(NEW.username, current_user);
+        END IF;
+
+        -- Set changeuser_id (self-reference if not set)
+        IF NEW.changeuser_id IS NULL THEN
+            NEW.changeuser_id := NEW.userid;
+        END IF;
+
+        -- Set changeuser if NULL
+        IF NEW.changeuser IS NULL THEN
+            NEW.changeuser := user_name;
+        END IF;
+
+        -- Set timestamp
+        NEW.changetimestamp := NOW() AT TIME ZONE 'UTC';
+
+    ELSE
+        -- Other tables: wfm_nedapons_clients, vismanet_nedapons_clients, etc.
+        IF NEW.changeuser IS NOT NULL THEN
+            user_name := NEW.changeuser;
+        ELSE
+            user_name := current_user;
+        END IF;
+
+        -- Lookup user_id in dbusers
+        SELECT userid INTO user_id
+        FROM dbusers
+        WHERE username = user_name
+        LIMIT 1;
+
+        IF user_id IS NULL THEN
+            RAISE EXCEPTION 'User "%" does not exist', user_name;
+        END IF;
+
+        -- Populate NEW row
+        NEW.changeuser_id := user_id;
+        NEW.changeuser := user_name;
+        NEW.changetimestamp := NOW() AT TIME ZONE 'UTC';
+    END IF;
+
+-- Cascade username changes (only for dbusers)
+    IF TG_TABLE_NAME = 'dbusers' AND TG_OP = 'UPDATE' THEN
+        IF OLD.username <> NEW.username THEN
+            -- Update dbusers self-references
+            UPDATE dbusers
+            SET changeuser = NEW.username
+            WHERE changeuser_id = OLD.userid;
+
+            -- Update WFM clients if table exists
+            IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'wfm_nedapons_clients') THEN
+                UPDATE wfm_nedapons_clients
+                SET changeuser = NEW.username
+                WHERE changeuser_id = OLD.userid;
+            END IF;
+
+            -- Update VismaNet clients if table exists
+            IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'vismanet_nedapons_clients') THEN
+                UPDATE vismanet_nedapons_clients
+                SET changeuser = NEW.username
+                WHERE changeuser_id = OLD.userid;
+            END IF;
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to get clientid by name
+CREATE OR REPLACE FUNCTION get_clientid(client_name VARCHAR,exception BOOLEAN)
+RETURNS UUID AS $$
+DECLARE
+    cid UUID;
+BEGIN
+    -- Try WFM first
+    SELECT clientid INTO cid FROM wfm_nedapons_clients WHERE replace(lower(client),' ','') = replace(lower(client_name),' ','') LIMIT 1;
+    -- If not found, try VismaNet
+    IF cid IS NULL THEN SELECT clientid INTO cid FROM vismanet_nedapons_clients WHERE replace(lower(client),' ','') = replace(lower(client_name),' ','') LIMIT 1;
+    END IF;
+
+    -- If still not found, raise exception
+    IF cid IS NULL THEN
+        IF exception IS NULL THEN
+            RAISE EXCEPTION 'Client "%" not found in WFM or VismaNet', client_name;
+        ELSE
+            RETURN NULL;
+        END IF;
+    END IF;
+
+    -- If cid found but exception flag says we should raise
+    IF cid IS NOT NULL AND exception IS NOT NULL AND exception THEN
+        RAISE EXCEPTION 'Client "%" already exists in WFM or VismaNet', client_name;
+    END IF;
+
+    RETURN cid;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Set active
+CREATE OR REPLACE FUNCTION trg_update_client_active()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_clientid UUID;
+    all_filled BOOLEAN;
+BEGIN
+
+    -- Prevent recursion loops
+    IF pg_trigger_depth() > 1 THEN
+        RETURN NEW;
+    END IF;
+    IF TG_TABLE_NAME IN ('vismanet_nedapons_clients', 'wfm_nedapons_clients') THEN
+
+        -- Do NOT block updates, only recompute state from nedapons
+
+        IF TG_TABLE_NAME = 'vismanet_nedapons_clients' THEN
+
+            v_clientid := NEW.clientid;
+
+            SELECT COALESCE(bool_and(
+                api_certificate IS NOT NULL
+                AND api_certificate_pass IS NOT NULL
+                AND xml_pass IS NOT NULL
+            ), FALSE)
+            INTO all_filled
+            FROM nedapons
+            WHERE clientid_vismanet = v_clientid;
+
+            -- IMPORTANT: no re-trigger loop possible because we only update same row safely
+            NEW.active := all_filled;
+            NEW.changetimestamp := NOW();
+
+        ELSIF TG_TABLE_NAME = 'wfm_nedapons_clients' THEN
+
+            v_clientid := NEW.clientid;
+
+            SELECT COALESCE(bool_and(
+                api_certificate IS NOT NULL
+                AND api_certificate_pass IS NOT NULL
+                AND xml_pass IS NOT NULL
+            ), FALSE)
+            INTO all_filled
+            FROM nedapons
+            WHERE clientid_wfm = v_clientid;
+
+            NEW.active := all_filled;
+            NEW.changetimestamp := NOW();
+
+        END IF;
+
+        RETURN NEW;
+    END IF;
+
+    -- NEDAPONS TABLE LOGIC
+    IF TG_TABLE_NAME = 'nedapons' THEN
+
+        -- VISMANET
+        v_clientid := COALESCE(NEW.clientid_vismanet, OLD.clientid_vismanet);
+
+        IF v_clientid IS NOT NULL THEN
+            SELECT COALESCE(bool_and(
+                api_certificate IS NOT NULL
+                AND api_certificate_pass IS NOT NULL
+                AND xml_pass IS NOT NULL
+            ), FALSE)
+            INTO all_filled
+            FROM nedapons
+            WHERE clientid_vismanet = v_clientid;
+
+            IF all_filled THEN
+                UPDATE vismanet_nedapons_clients
+                SET active = TRUE,
+                    changetimestamp = NOW()
+                WHERE clientid = v_clientid
+                  AND active = FALSE;
+            END IF;
+        END IF;
+
+        -- WFM
+        v_clientid := COALESCE(NEW.clientid_wfm, OLD.clientid_wfm);
+
+        IF v_clientid IS NOT NULL THEN
+            SELECT COALESCE(bool_and(
+                api_certificate IS NOT NULL
+                AND api_certificate_pass IS NOT NULL
+                AND xml_pass IS NOT NULL
+            ), FALSE)
+            INTO all_filled
+            FROM nedapons
+            WHERE clientid_wfm = v_clientid;
+
+            IF all_filled THEN
+                UPDATE wfm_nedapons_clients
+                SET active = TRUE,
+                    changetimestamp = NOW()
+                WHERE clientid = v_clientid
+                  AND active = FALSE;
+            END IF;
+        END IF;
+
+        RETURN NEW;
+    END IF;
+    -- fallback
+    RETURN NEW;
+
+END;
+$$ LANGUAGE plpgsql;
+
+
+--#Triggers
+
+-- dbusers
+CREATE OR REPLACE TRIGGER trg_set_dbusers_changeuser
+BEFORE INSERT OR UPDATE ON dbusers
+FOR EACH ROW
+EXECUTE FUNCTION set_changeuser()
+
+--WFM
+CREATE OR REPLACE TRIGGER trg_set_wfm_clients_changeuser
+BEFORE INSERT OR UPDATE ON wfm_nedapons_clients
+FOR EACH ROW
+EXECUTE FUNCTION set_changeuser()
+
+--VismaNet 
+CREATE OR REPLACE TRIGGER trg_set_vismanet_nedapons_clients
+BEFORE INSERT OR UPDATE ON vismanet_nedapons_clients
+FOR EACH ROW
+EXECUTE FUNCTION set_changeuser()
+
+--Nedap
+CREATE OR REPLACE TRIGGER trg_set_nedapons
+BEFORE INSERT OR UPDATE ON nedapons
+FOR EACH ROW
+EXECUTE FUNCTION set_changeuser()
+
+--Auto active
+CREATE TRIGGER trg_vclients_active
+BEFORE UPDATE ON vismanet_nedapons_clients
+FOR EACH ROW
+EXECUTE FUNCTION trg_update_client_active();
+
+CREATE TRIGGER trg_wlients_active
+BEFORE UPDATE ON wfm_nedapons_clients
+FOR EACH ROW
+EXECUTE FUNCTION trg_update_client_active();
+
+CREATE TRIGGER trg_nedapons_active
+AFTER INSERT OR UPDATE ON nedapons
+FOR EACH ROW
+EXECUTE FUNCTION trg_update_client_active();
